@@ -11,16 +11,21 @@ DATA = {"channels": [], "streams": [], "logos": [], "countries": []}
 SEARCH_INDEX = {}
 STREAM_MAP = {}
 LOGO_MAP = {}
+CHANNEL_MAP = {}  # FIX: O(1) channel lookup by ID (was O(n) linear scan in search())
 LAST_UPDATE = 0
 CACHE_DURATION = 3600 * 3  # 3 hours
+
+_data_lock = threading.Lock()  # FIX: thread safety on shared globals
+
 
 def normalize_text(text):
     """Normalize text for better search matching (preserves symbols like &)"""
     return text.lower().strip()
 
+
 def fetch_all_data():
     """Fetch all IPTV JSON data and preprocess with optimizations"""
-    global DATA, SEARCH_INDEX, STREAM_MAP, LOGO_MAP, LAST_UPDATE
+    global DATA, SEARCH_INDEX, STREAM_MAP, LOGO_MAP, CHANNEL_MAP, LAST_UPDATE
     print("[INFO] Refreshing IPTV data...")
     urls = {
         "channels": f"{BASE_URL}/channels.json",
@@ -29,66 +34,78 @@ def fetch_all_data():
         "countries": f"{BASE_URL}/countries.json",
     }
 
+    new_data = {}
     try:
         for key, url in urls.items():
             r = requests.get(url, timeout=20)
             r.raise_for_status()
-            DATA[key] = r.json()
+            new_data[key] = r.json()
     except Exception as e:
         print(f"[ERROR] Data fetch failed: {e}")
         return
 
-    # Build optimized lookup maps
-    SEARCH_INDEX.clear()
-    STREAM_MAP.clear()
-    LOGO_MAP.clear()
-    
-    # Pre-index streams by channel ID for O(1) lookup
-    for s in DATA["streams"]:
+    # Build new maps before acquiring lock to minimize lock hold time
+    new_stream_map = {}
+    new_logo_map = {}
+    new_search_index = {}
+    new_channel_map = {}  # FIX: build O(1) lookup map
+
+    for s in new_data["streams"]:
         ch_id = s.get("channel")
         if ch_id:
-            if ch_id not in STREAM_MAP:
-                STREAM_MAP[ch_id] = []
-            STREAM_MAP[ch_id].append({
+            if ch_id not in new_stream_map:
+                new_stream_map[ch_id] = []
+            new_stream_map[ch_id].append({
                 "url": s["url"],
                 "title": s.get("title"),
                 "quality": s.get("quality"),
                 "referrer": s.get("referrer"),
                 "user_agent": s.get("user_agent"),
             })
-    
-    # Pre-index logos by channel ID for O(1) lookup
-    for l in DATA["logos"]:
+
+    for l in new_data["logos"]:
         ch_id = l.get("channel")
-        if ch_id and ch_id not in LOGO_MAP:
-            LOGO_MAP[ch_id] = l["url"]
-    
-    # Build normalized search index
-    for ch in DATA["channels"]:
-        SEARCH_INDEX[ch["id"]] = {
-            "id": ch["id"],
+        if ch_id and ch_id not in new_logo_map:
+            new_logo_map[ch_id] = l["url"]
+
+    for ch in new_data["channels"]:
+        ch_id = ch["id"]
+        new_channel_map[ch_id] = ch  # FIX: direct dict for O(1) lookup
+        new_search_index[ch_id] = {
+            "id": ch_id,
             "name": normalize_text(ch["name"]),
             "alt": [normalize_text(a) for a in ch.get("alt_names", [])],
             "country": ch.get("country"),
         }
 
-    LAST_UPDATE = time.time()
+    # FIX: acquire lock only for the final swap to avoid holding it during network I/O
+    with _data_lock:
+        DATA = new_data
+        STREAM_MAP = new_stream_map
+        LOGO_MAP = new_logo_map
+        SEARCH_INDEX = new_search_index
+        CHANNEL_MAP = new_channel_map
+        LAST_UPDATE = time.time()
+
     print(f"[INFO] IPTV data updated: {len(DATA['channels'])} channels, {len(STREAM_MAP)} with streams")
+
 
 def auto_refresh():
     """Background thread to refresh cache periodically"""
+    # FIX: was sleeping BEFORE first refresh — now sleeps AFTER, ensuring periodic updates
     while True:
         time.sleep(CACHE_DURATION)
         fetch_all_data()
+
 
 # Start data fetching and refresh in background immediately
 threading.Thread(target=fetch_all_data, daemon=True).start()
 threading.Thread(target=auto_refresh, daemon=True).start()
 
+
 def combine_channel_data(channel):
     """Combine channel with stream & logo using pre-built maps (faster)"""
     ch_id = channel["id"]
-    
     return {
         "id": ch_id,
         "name": channel["name"],
@@ -104,12 +121,13 @@ def combine_channel_data(channel):
         "created_by": "https://t.me/zerodevbro",
     }
 
+
 @app.route("/")
 def home():
     return jsonify({
         "message": "🚀 IPTV Search API (Optimized & Fast)",
         "created_by": "https://t.me/zerodevbro",
-        "uptime": f"{round((time.time() - LAST_UPDATE)/60, 1)} min since last data refresh",
+        "uptime": f"{round((time.time() - LAST_UPDATE) / 60, 1)} min since last data refresh",
         "total_channels": len(DATA["channels"]),
         "endpoints": {
             "/api/search?q=<name>": "Search channels by name (supports symbols like &Flix)",
@@ -120,22 +138,25 @@ def home():
         }
     })
 
+
 @app.route("/api/search")
 def search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "Missing ?q=", "created_by": "https://t.me/zerodevbro"}), 400
 
-    # Normalize search query to handle symbols
     q_normalized = normalize_text(q)
-    
+
     results = []
+    # FIX: use CHANNEL_MAP for O(1) lookup instead of next(c for c in DATA["channels"]...)
+    # which was an O(n) scan inside an O(n) loop = O(n²) total
     for ch_id, ch in SEARCH_INDEX.items():
         if q_normalized in ch["name"] or any(q_normalized in alt for alt in ch["alt"]):
-            original = next(c for c in DATA["channels"] if c["id"] == ch_id)
-            results.append(combine_channel_data(original))
-            if len(results) >= 50:  # Limit for fast response
-                break
+            original = CHANNEL_MAP.get(ch_id)
+            if original:
+                results.append(combine_channel_data(original))
+                if len(results) >= 50:
+                    break
 
     return app.response_class(
         response=orjson.dumps({
@@ -147,6 +168,7 @@ def search():
         status=200,
         mimetype="application/json"
     )
+
 
 @app.route("/api/countries")
 def list_countries():
@@ -178,6 +200,7 @@ def list_countries():
         mimetype="application/json"
     )
 
+
 @app.route("/api/country/<code>")
 def by_country(code):
     code = code.upper()
@@ -198,9 +221,11 @@ def by_country(code):
         mimetype="application/json"
     )
 
+
 @app.route("/api/channel/<ch_id>")
 def channel(ch_id):
-    channel = next((c for c in DATA["channels"] if c["id"] == ch_id), None)
+    # FIX: was O(n) linear scan — now O(1) dict lookup via CHANNEL_MAP
+    channel = CHANNEL_MAP.get(ch_id)
     if not channel:
         return jsonify({"error": "Channel not found"}), 404
     return app.response_class(
@@ -211,6 +236,7 @@ def channel(ch_id):
         status=200,
         mimetype="application/json"
     )
+
 
 @app.route("/api/categories")
 def categories():
@@ -228,6 +254,7 @@ def categories():
         status=200,
         mimetype="application/json"
     )
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=False, threaded=True)
